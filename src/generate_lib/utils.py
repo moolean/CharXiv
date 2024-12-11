@@ -1,29 +1,69 @@
 import time
 from tqdm import tqdm
+from multiprocessing import Pool, Manager
 
-def generate_response_remote_wrapper(generate_fn, 
-        queries, model_path, api_key, client, init_sleep=1, 
-        max_retries=10, sleep_factor=1.6):
-    for k in tqdm(queries):
-        sleep_time = init_sleep
-        query = queries[k]['question']
-        image = queries[k]["figure_path"]
-        curr_retries = 0
-        result = None
-        while curr_retries < max_retries and result is None:
-            try:
-                result = generate_fn(image, query, model_path, 
-                    api_key=api_key, client=client, random_baseline=False)
-            except Exception as e:
-                print(f"Error: {e}")
-                print(f"Error {curr_retries}, sleeping for {sleep_time} seconds...")
-                time.sleep(sleep_time)
-                curr_retries += 1
-                sleep_time *= sleep_factor
-        if result is None:
-            result = "Error in generating response."
-            print(f"Error in generating response for {k}")
-        queries[k]['response'] = result
+def process_query(args):
+    """
+    Process a single query using the generate_fn function with retry logic.
+    
+    Args:
+        args (tuple): Contains all arguments needed for processing a single query.
+
+    Returns:
+        tuple: (query_key, result)
+    """
+    k, query_data, generate_fn, model_path, api_key, client, init_sleep, max_retries, sleep_factor = args
+    sleep_time = init_sleep
+    query = query_data['question']
+    image = query_data["figure_path"]
+    curr_retries = 0
+    result = None
+
+    while curr_retries < max_retries and result is None:
+        try:
+            result = generate_fn(image, query, model_path, api_key=api_key, client=client, random_baseline=False)
+        except Exception as e:
+            print(f"Error: {e}")
+            print(f"Error {curr_retries}, sleeping for {sleep_time} seconds...")
+            time.sleep(sleep_time)
+            curr_retries += 1
+            sleep_time *= sleep_factor
+
+    if result is None:
+        result = "Error in generating response."
+        print(f"Error in generating response for {k}")
+
+    return k, result
+
+def generate_response_remote_wrapper(generate_fn, queries, model_path, api_key, client, init_sleep=1, max_retries=10, sleep_factor=1.6, num_workers=16):
+    """
+    Wrapper function to handle multiple queries using multiprocessing.
+
+    Args:
+        generate_fn (callable): The function to generate a response for a query.
+        queries (dict): Dictionary of queries where each key maps to query data.
+        model_path (str): Path to the model to be used.
+        api_key (str): API key for authentication.
+        client (str): Client identifier.
+        init_sleep (float): Initial sleep time between retries.
+        max_retries (int): Maximum number of retries for each query.
+        sleep_factor (float): Factor by which to multiply sleep time after each retry.
+        num_workers (int): Number of parallel workers to use.
+
+    Returns:
+        None: Updates the `queries` dictionary with responses.
+    """
+    manager = Manager()
+    queries_shared = manager.dict(queries)
+
+    with Pool(processes=num_workers) as pool:
+        args = [
+            (k, queries_shared[k], generate_fn, model_path, api_key, client, init_sleep, max_retries, sleep_factor)
+            for k in queries
+        ]
+
+        for k, result in tqdm(pool.imap_unordered(process_query, args), total=len(queries)):
+            queries[k]['response'] = result
 
 def get_client_fn(model_path):
     if model_path in ['claude-3-sonnet-20240229', 
@@ -56,6 +96,8 @@ def get_client_fn(model_path):
     # internvl2pro
     elif model_path in ['InternVL2-Pro']:
         from .internvl2pro import get_client_model
+    elif model_path in ['SenseChat-5-Vision']:
+        from .sensechat_vision import get_client_model
     else:
         raise ValueError(f"Model {model_path} not supported")
     return get_client_model
@@ -173,6 +215,8 @@ def get_generate_fn(model_path):
         from .textmonkey import generate_response
     elif model_name in ['cogagent-vqa-hf']:
         from .cogagent import generate_response
+    elif model_name in ['SenseChat-5-Vision']:
+        from .sensechat_vision import generate_response
     else:
         raise ValueError(f"Model {model_name} not supported")
     return generate_response
